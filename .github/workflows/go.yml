@@ -1,18 +1,22 @@
-# This workflow will build a golang project
+# This workflow will build a golang project, version it, and deploy
 # For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-go
 
-name: Go
+name: Go CI/CD
 
 on:
   push:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
-  release:
-    types: ["published"]
+
+# Prevent concurrent deployments to avoid version conflicts
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build:
+  build-and-test:
+    name: Build and Test
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -27,9 +31,52 @@ jobs:
 
     - name: Test
       run: go test -v ./...
-  push_to_registry:
-    name: Push Docker image to Docker Hub
+
+  version-and-tag:
+    name: Calculate Version and Tag
     runs-on: ubuntu-latest
+    # Only version on pushes to main, not on PRs
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build-and-test
+    permissions:
+      contents: write
+    outputs:
+      new_version: ${{ steps.version.outputs.version }}
+      new_tag: ${{ steps.version.outputs.version_tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for version calculation
+
+      - name: Calculate next version
+        id: version
+        uses: paulhatch/semantic-version@v5.4.0
+        with:
+          # The prefix to use to identify tags
+          tag_prefix: "v"
+          # Base version (major.minor)
+          major_pattern: "(MAJOR)"
+          minor_pattern: "(MINOR)"
+          version_format: "${major}.${minor}.${patch}"
+          # Starting version if no tags exist
+          bump_each_commit: true
+          search_commit_body: false
+          # User-defined fields to increment
+          user_format_type: "csv"
+
+      - name: Create and push tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a ${{ steps.version.outputs.version_tag }} -m "Release ${{ steps.version.outputs.version_tag }}"
+          git push origin ${{ steps.version.outputs.version_tag }}
+
+  docker-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: version-and-tag
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       packages: write
       contents: read
@@ -37,31 +84,28 @@ jobs:
       id-token: write
     steps:
       - name: Check out the repo
-        uses: actions/checkout@v5
-      - name: Set up Docker
-        uses: docker/setup-docker-action@v4
-        with:
-          daemon-config: |
-            {
-              "debug": true,
-              "features": {
-                "containerd-snapshotter": true
-              }
-            }
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
           password: ${{ secrets.DOCKER_HUB_PASSWORD }}
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
       - name: Extract metadata (tags, labels) for Docker
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: braxtone/goodbetterwurst
+          tags: |
+            type=raw,value=${{ needs.version-and-tag.outputs.new_version }}
+            type=raw,value=latest
 
       - name: Build and push Docker image
         id: push
@@ -69,15 +113,38 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          labels: ${{ steps.meta.outputs.labels }}
-          tags: ${{ steps.meta.outputs.tags }}
-          load: true
-          platforms: linux/amd64, linux/arm64
+          platforms: linux/amd64,linux/arm64
           push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
 
       - name: Generate artifact attestation
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@v2
         with:
           subject-name: index.docker.io/braxtone/goodbetterwurst
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
+
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: version-and-tag
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version-and-tag.outputs.new_tag }}
+          name: ${{ needs.version-and-tag.outputs.new_tag }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
