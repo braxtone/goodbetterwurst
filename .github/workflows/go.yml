@@ -9,6 +9,8 @@ on:
   pull_request:
     branches: [ "main" ]
 
+permissions: {}
+
 # Prevent concurrent deployments to avoid version conflicts
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -18,8 +20,11 @@ jobs:
   build-and-test:
     name: Build and Test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
     - uses: actions/checkout@v4
+      # https://github.com/actions/checkout?tab=readme-ov-file#recommended-permissions
 
     - name: Set up Go
       uses: actions/setup-go@v4
@@ -78,10 +83,14 @@ jobs:
     needs: version-and-tag
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
-      packages: write
+      # actions/checkout
       contents: read
+      # actions/attest-build-provenance
       attestations: write
+      # actions/attest-build-provenance
       id-token: write
+      # actions/attest-build-provenance
+      artifact-metadata: write
     steps:
       - name: Check out the repo
         uses: actions/checkout@v4
@@ -119,7 +128,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
 
       - name: Generate artifact attestation
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v3
         with:
           subject-name: index.docker.io/braxtone/goodbetterwurst
           subject-digest: ${{ steps.push.outputs.digest }}
